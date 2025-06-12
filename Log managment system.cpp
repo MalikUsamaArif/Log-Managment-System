@@ -1,4 +1,6 @@
-﻿#include <iostream>
+#define _CRT_SECURE_NO_WARNINGS // Disable deprecation warnings for ctime
+
+#include <iostream>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -12,443 +14,682 @@
 #include <thread>
 #include <sstream>
 #include <iomanip>
-#include <nlohmann/json.hpp>
-#include <dirent.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <signal.h>
+#include <windows.h>
+#include <tlhelp32.h>
 
-using json = nlohmann::json;
 using namespace std;
 using namespace std::chrono;
 
+// ====================== UTILITY FUNCTIONS ======================
+
+void clearScreen() {
+    system("cls");
+}
+
+void printColored(const string& text, int color) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, color);
+    cout << text;
+    SetConsoleTextAttribute(hConsole, 7); // Reset to default
+}
+
+void printHeader(const string& title) {
+    clearScreen();
+    printColored("\n========================================\n", 10);
+    printColored("          " + title + "\n", 12);
+    printColored("========================================\n\n", 10);
+}
+
+void printMenuOption(int num, const string& text) {
+    printColored(" " + to_string(num) + ". ", 11);
+    printColored(text + "\n", 15);
+}
+
+void printError(const string& message) {
+    printColored("[ERROR] " + message + "\n", 12);
+}
+
+void printSuccess(const string& message) {
+    printColored("[SUCCESS] " + message + "\n", 10);
+}
+
+void printWarning(const string& message) {
+    printColored("[WARNING] " + message + "\n", 14);
+}
+
+string formatTime(time_t time) {
+    char buffer[26];
+    ctime_s(buffer, sizeof(buffer), &time);
+    string timeStr(buffer);
+    timeStr.pop_back(); // Remove newline
+    return timeStr;
+}
+
 // ====================== CUSTOM DATA STRUCTURES ======================
 
-// Custom Min-Heap for priority-based log processing
-template<typename T, typename Compare = less<T>>
-class PriorityLogQueue {
+class LogBuffer {
 private:
-    vector<T> heap;
-    Compare comp;
-    mutex mtx;
-
-    void heapify_up(int index) {
-        while (index > 0) {
-            int parent = (index - 1) / 2;
-            if (comp(heap[parent], heap[index])) break;
-            swap(heap[parent], heap[index]);
-            index = parent;
-        }
-    }
-
-    void heapify_down(int index) {
-        int left, right, largest;
-        while (true) {
-            left = 2 * index + 1;
-            right = 2 * index + 2;
-            largest = index;
-
-            if (left < heap.size() && comp(heap[left], heap[largest]))
-                largest = left;
-            if (right < heap.size() && comp(heap[right], heap[largest]))
-                largest = right;
-            if (largest == index) break;
-
-            swap(heap[index], heap[largest]);
-            index = largest;
-        }
-    }
+    static const int MAX_CAPACITY = 10000;  // Maximum number of logs to store
+    vector<string> buffer;                  // Changed from json array to string vector
+    int head = 0;                           // Index of the oldest log
+    int tail = 0;                           // Index where next log will be added
+    int count = 0;                          // Current number of logs
+    mutable std::mutex mtx;                 // Mutex for thread safety
 
 public:
-    void push(const T& value) {
-        lock_guard<mutex> lock(mtx);
-        heap.push_back(value);
-        heapify_up(heap.size() - 1);
+    LogBuffer() : buffer(MAX_CAPACITY) {}   // Initialize buffer with size
+
+    // Add a new log to the buffer
+    bool push(const string& log) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (count == MAX_CAPACITY) {
+            return false;  // Buffer is full
+        }
+
+        buffer[tail] = log;
+        tail = (tail + 1) % MAX_CAPACITY;
+        count++;
+        return true;
     }
 
-    T pop() {
-        lock_guard<mutex> lock(mtx);
-        T top = heap.front();
-        heap[0] = heap.back();
-        heap.pop_back();
-        if (!heap.empty()) heapify_down(0);
-        return top;
+    // Remove and return the oldest log
+    bool pop(string& log) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (count == 0) {
+            return false;  // Buffer is empty
+        }
+
+        log = buffer[head];
+        head = (head + 1) % MAX_CAPACITY;
+        count--;
+        return true;
     }
 
-    bool empty() const {
-        return heap.empty();
+    // Get all logs as a vector
+    vector<string> to_vector() const {
+        std::lock_guard<std::mutex> lock(mtx);
+        vector<string> logs;
+        for (int i = 0; i < count; i++) {
+            logs.push_back(buffer[(head + i) % MAX_CAPACITY]);
+        }
+        return logs;
     }
 
-    size_t size() const {
-        return heap.size();
+    // Get the number of logs currently in the buffer
+    int size() const { 
+        std::lock_guard<std::mutex> lock(mtx);
+        return count; 
+    }
+
+    // Check if the buffer is empty
+    bool empty() const { 
+        std::lock_guard<std::mutex> lock(mtx);
+        return count == 0; 
+    }
+
+    // Check if the buffer is full
+    bool full() const { 
+        std::lock_guard<std::mutex> lock(mtx);
+        return count == MAX_CAPACITY; 
+    }
+
+    // Clear all logs from the buffer
+    void clear() {
+        std::lock_guard<std::mutex> lock(mtx);
+        head = 0;
+        tail = 0;
+        count = 0;
     }
 };
 
-// Custom Graph for log relationship analysis
-class LogRelationshipGraph {
+class LogSearchIndex {
 private:
-    unordered_map<string, vector<pair<string, int>>> adj_list;
-    mutex mtx;
+    struct TrieNode {
+        unordered_map<char, shared_ptr<TrieNode>> children;
+        vector<size_t> log_indices;
+    };
+
+    shared_ptr<TrieNode> root;
+    vector<string>* log_store;  // Changed from vector<json> to vector<string>
+    mutable std::mutex mtx;
 
 public:
-    void add_relationship(const string& src, const string& dest, int weight = 1) {
-        lock_guard<mutex> lock(mtx);
-        adj_list[src].emplace_back(dest, weight);
-        adj_list[dest]; // Ensure destination exists in map
-    }
+    explicit LogSearchIndex(vector<string>& store) : log_store(&store), root(make_shared<TrieNode>()) {}
 
-    vector<pair<string, int>> get_related_logs(const string& log_type) {
-        lock_guard<mutex> lock(mtx);
-        return adj_list[log_type];
-    }
-
-    void print_top_relationships(int count = 5) {
-        lock_guard<mutex> lock(mtx);
-        PriorityLogQueue<pair<string, int>, greater<pair<string, int>>> pq;
-
-        for (const auto& entry : adj_list) {
-            int total_weight = 0;
-            for (const auto& rel : entry.second) {
-                total_weight += rel.second;
+    void insert(const string& text, size_t log_index) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto node = root;
+        for (char ch : text) {
+            if (!node->children[ch]) {
+                node->children[ch] = make_shared<TrieNode>();
             }
-            pq.push({ total_weight, entry.first });
+            node = node->children[ch];
+            node->log_indices.push_back(log_index);
+        }
+    }
+
+    vector<string> search(const string& query) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto node = root;
+
+        for (char ch : query) {
+            if (!node->children[ch]) {
+                return {};
+            }
+            node = node->children[ch];
         }
 
-        cout << "Top " << count << " Log Relationships:\n";
-        for (int i = 0; i < count && !pq.empty(); ++i) {
-            auto item = pq.pop();
-            cout << i + 1 << ". " << item.second << " (weight: " << item.first << ")\n";
+        vector<string> results;
+        queue<shared_ptr<TrieNode>> q;
+        q.push(node);
+
+        while (!q.empty()) {
+            auto current = q.front();
+            q.pop();
+
+            for (size_t index : current->log_indices) {
+                if (index < log_store->size()) {
+                    results.push_back((*log_store)[index]);
+                }
+            }
+
+            for (auto& child_pair : current->children) {
+                q.push(child_pair.second);
+            }
         }
+
+        return results;
     }
 };
 
-// ====================== LOG MANAGEMENT SYSTEM ======================
+// ====================== WINDOWS PROCESS UTILITIES ======================
+
+vector<pair<DWORD, string>> getRunningProcesses() {
+    vector<pair<DWORD, string>> processes;
+    HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcessSnap == INVALID_HANDLE_VALUE) {
+        printError("Failed to create process snapshot");
+        return processes;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (!Process32First(hProcessSnap, &pe32)) {
+        CloseHandle(hProcessSnap);
+        printError("Failed to get first process");
+        return processes;
+    }
+
+    do {
+        wstring wideName(pe32.szExeFile);
+        string processName(wideName.begin(), wideName.end());
+        processes.emplace_back(pe32.th32ProcessID, processName);
+    } while (Process32Next(hProcessSnap, &pe32));
+
+    CloseHandle(hProcessSnap);
+    return processes;
+}
+
+string getProcessName(DWORD pid) {
+    HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcessSnap == INVALID_HANDLE_VALUE) {
+        return "Unknown";
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (!Process32First(hProcessSnap, &pe32)) {
+        CloseHandle(hProcessSnap);
+        return "Unknown";
+    }
+
+    do {
+        if (pe32.th32ProcessID == pid) {
+            wstring wideName(pe32.szExeFile);
+            string processName;
+            processName.reserve(wideName.length());
+            for (wchar_t wc : wideName) {
+                processName += static_cast<char>(wc & 0xFF);  // Safe conversion
+            }
+            CloseHandle(hProcessSnap);
+            return processName;
+        }
+    } while (Process32Next(hProcessSnap, &pe32));
+
+    CloseHandle(hProcessSnap);
+    return "Unknown";
+}
+
+// ====================== LOG MANAGER CLASS ======================
 
 class LogManager {
 private:
     struct LogProcess {
-        pid_t pid;
+        DWORD pid;
         string program_name;
         string log_file;
         time_t start_time;
         thread worker_thread;
+        bool running = true;
+
+        LogProcess(DWORD p, const string& name, const string& file)
+            : pid(p), program_name(name), log_file(file), start_time(time(nullptr)) {
+        }
     };
 
-    unordered_map<pid_t, LogProcess> active_processes;
-    LogRelationshipGraph log_graph;
+    vector<string> all_logs;  // Changed from vector<json> to vector<string>
+    LogBuffer recent_logs;
+    LogSearchIndex search_index;
+    unordered_map<DWORD, unique_ptr<LogProcess>> active_processes;
     mutex process_mutex;
-    string log_directory = "./logs";
-
-    // Bloom Filter for fast log type checking
-    class LogTypeFilter {
-    private:
-        vector<bool> bits;
-        const int size = 1000;
-        mutex mtx;
-
-        size_t hash1(const string& s) const {
-            hash<string> hasher;
-            return hasher(s) % size;
-        }
-
-        size_t hash2(const string& s) const {
-            size_t h = 0;
-            for (char c : s) h = (h * 31 + c) % size;
-            return h;
-        }
-
-    public:
-        LogTypeFilter() : bits(size, false) {}
-
-        void add(const string& log_type) {
-            lock_guard<mutex> lock(mtx);
-            bits[hash1(log_type)] = true;
-            bits[hash2(log_type)] = true;
-        }
-
-        bool might_contain(const string& log_type) const {
-            lock_guard<mutex> lock(mtx);
-            return bits[hash1(log_type)] && bits[hash2(log_type)];
-        }
-    } log_type_filter;
+    string log_directory = "logs";
 
     void monitor_process(LogProcess& lp) {
         ofstream log_file(lp.log_file, ios::app);
         if (!log_file) {
-            cerr << "Failed to open log file for " << lp.program_name << endl;
+            printError("Failed to open log file for " + lp.program_name);
             return;
         }
 
-        string command = "strace -p " + to_string(lp.pid) + " -f -e trace=write -o /dev/stdout 2>&1";
-        FILE* pipe = popen(command.c_str(), "r");
-        if (!pipe) return;
-
-        char buffer[1024];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            string log_entry(buffer);
+        while (lp.running) {
             time_t now = time(nullptr);
+            string timestamp = formatTime(now);
+            string log_entry = timestamp + " | PID: " + to_string(lp.pid) + 
+                             " | Program: " + lp.program_name + 
+                             " | Activity: Process running" +
+                             " | Severity: " + classify_severity("Process running");
 
-            json log_json = {
-                {"pid", lp.pid},
-                {"program", lp.program_name},
-                {"timestamp", now},
-                {"entry", log_entry},
-                {"type", "system_call"}
-            };
+            {
+                lock_guard<mutex> lock(process_mutex);
+                all_logs.push_back(log_entry);
+                recent_logs.push(log_entry);
+                search_index.insert(log_entry, all_logs.size() - 1);
+            }
 
-            log_file << log_json.dump() << "\n";
-            log_type_filter.add("system_call");
-            log_graph.add_relationship(lp.program_name, "system_call");
+            log_file << log_entry << "\n";
+            log_file.flush();
+            this_thread::sleep_for(seconds(1));
         }
-        pclose(pipe);
     }
 
-    vector<json> load_log_file(const string& filename) {
-        vector<json> logs;
+    vector<string> load_log_file(const string& filename) {
+        vector<string> logs;
         ifstream file(filename);
         string line;
 
         while (getline(file, line)) {
-            try {
-                logs.push_back(json::parse(line));
-            }
-            catch (...) {
-                cerr << "Failed to parse log entry: " << line << endl;
+            if (!line.empty()) {
+                logs.push_back(line);
+                search_index.insert(line, all_logs.size());
             }
         }
         return logs;
     }
 
+    string classify_severity(const string& log_entry) {
+        if (log_entry.find("error") != string::npos ||
+            log_entry.find("Error") != string::npos ||
+            log_entry.find("ERROR") != string::npos) {
+            return "high";
+        }
+        if (log_entry.find("warn") != string::npos ||
+            log_entry.find("WARN") != string::npos) {
+            return "medium";
+        }
+        if (log_entry.find("fail") != string::npos) {
+            return "medium";
+        }
+        return "low";
+    }
+
     vector<string> get_all_log_files() {
         vector<string> files;
-        DIR* dir;
-        struct dirent* ent;
+        WIN32_FIND_DATAA findFileData;
+        HANDLE hFind = FindFirstFileA((log_directory + "\\*.log").c_str(), &findFileData);
 
-        if ((dir = opendir(log_directory.c_str())) != nullptr) {
-            while ((ent = readdir(dir)) != nullptr) {
-                string filename = ent->d_name;
-                if (filename.size() > 4 && filename.substr(filename.size() - 4) == ".log") {
-                    files.push_back(log_directory + "/" + filename);
-                }
-            }
-            closedir(dir);
+        if (hFind == INVALID_HANDLE_VALUE) {
+            return files;
         }
+
+        do {
+            files.push_back(log_directory + "\\" + findFileData.cFileName);
+        } while (FindNextFileA(hFind, &findFileData));
+
+        FindClose(hFind);
         return files;
     }
 
 public:
-    LogManager() {
-        // Create log directory if it doesn't exist
-        struct stat st;
-        if (stat(log_directory.c_str(), &st) == -1) {
-            mkdir(log_directory.c_str(), 0700);
+    LogManager() : search_index(all_logs) {
+        CreateDirectoryA(log_directory.c_str(), NULL);
+        load_existing_logs();
+    }
+
+    ~LogManager() {
+        for (auto& pair : active_processes) {
+            pair.second->running = false;
+            if (pair.second->worker_thread.joinable()) {
+                pair.second->worker_thread.join();
+            }
         }
     }
 
-    void start_logging(pid_t pid, const string& program_name) {
+    void load_existing_logs() {
+        auto log_files = get_all_log_files();
+        for (const auto& file : log_files) {
+            auto logs = load_log_file(file);
+            all_logs.insert(all_logs.end(), logs.begin(), logs.end());
+        }
+    }
+
+    void start_logging(DWORD pid, const string& program_name) {
         lock_guard<mutex> lock(process_mutex);
         if (active_processes.count(pid)) {
-            cout << "Already logging process " << pid << endl;
+            printWarning("Already logging process " + to_string(pid));
             return;
         }
 
-        string log_file = log_directory + "/" + program_name + "_" + to_string(pid) + ".log";
-        LogProcess lp{ pid, program_name, log_file, time(nullptr) };
-        lp.worker_thread = thread(&LogManager::monitor_process, this, ref(lp));
-        active_processes.emplace(pid, move(lp));
+        string log_file = log_directory + "\\" + program_name + "_" + to_string(pid) + ".log";
+        auto lp = make_unique<LogProcess>(pid, program_name, log_file);
+        lp->worker_thread = thread(&LogManager::monitor_process, this, ref(*lp));
 
-        cout << "Started logging for PID " << pid << " (" << program_name << ")\n";
-        cout << "Log file: " << log_file << endl;
+        active_processes.emplace(pid, move(lp));
+        printSuccess("Started logging for PID " + to_string(pid) + " (" + program_name + ")");
     }
 
-    void stop_logging(pid_t pid) {
-        lock_guard<mutex> lock(process_mutex);
-        auto it = active_processes.find(pid);
-        if (it == active_processes.end()) {
-            cout << "No active logging for PID " << pid << endl;
-            return;
+    void stop_logging(DWORD pid) {
+        unique_ptr<LogProcess> lp;
+        {
+            lock_guard<mutex> lock(process_mutex);
+            auto it = active_processes.find(pid);
+            if (it == active_processes.end()) {
+                printWarning("No active logging for PID " + to_string(pid));
+                return;
+            }
+            lp = move(it->second);
+            active_processes.erase(it);
         }
 
-        kill(pid, SIGCONT); // Ensure process is running to detach strace
-        it->second.worker_thread.detach();
-        active_processes.erase(it);
-
-        cout << "Stopped logging for PID " << pid << endl;
+        lp->running = false;
+        if (lp->worker_thread.joinable()) {
+            lp->worker_thread.join();
+        }
+        printSuccess("Stopped logging for PID " + to_string(pid));
     }
 
     void list_active_logs() {
         lock_guard<mutex> lock(process_mutex);
         if (active_processes.empty()) {
-            cout << "No active log processes\n";
+            printWarning("No active log processes");
             return;
         }
 
-        cout << "Active Log Processes:\n";
-        for (const auto& [pid, lp] : active_processes) {
-            cout << "PID: " << pid << "\tProgram: " << lp.program_name
-                << "\tLog File: " << lp.log_file << endl;
+        printColored("\nActive Log Processes:\n", 11);
+        printColored("----------------------------------------\n", 11);
+        printColored(" PID       Program           Log File\n", 11);
+        printColored("----------------------------------------\n", 11);
+
+        for (const auto& pair : active_processes) {
+            cout << " " << setw(8) << left << pair.first
+                << " " << setw(16) << left << pair.second->program_name.substr(0, 15)
+                << " " << pair.second->log_file.substr(0, 30) << "...\n";
         }
     }
 
-    void analyze_logs(pid_t pid) {
+    void analyze_logs(DWORD pid) {
         string log_file;
         {
             lock_guard<mutex> lock(process_mutex);
             auto it = active_processes.find(pid);
             if (it == active_processes.end()) {
-                cout << "No active logging for PID " << pid << endl;
-                return;
+                string pattern = "_" + to_string(pid) + ".log";
+                auto all_files = get_all_log_files();
+                for (const auto& file : all_files) {
+                    if (file.find(pattern) != string::npos) {
+                        log_file = file;
+                        break;
+                    }
+                }
+
+                if (log_file.empty()) {
+                    printError("No log file found for PID " + to_string(pid));
+                    return;
+                }
             }
-            log_file = it->second.log_file;
+            else {
+                log_file = it->second->log_file;
+            }
         }
 
-        vector<json> logs = load_log_file(log_file);
+        vector<string> logs = load_log_file(log_file);
         if (logs.empty()) {
-            cout << "No logs found for PID " << pid << endl;
+            printError("No logs found for PID " + to_string(pid));
             return;
         }
 
-        cout << "Loaded " << logs.size() << " log entries\n";
-        cout << "Enter analysis commands (type 'help' for options):\n";
+        printHeader("LOG ANALYSIS - PID: " + to_string(pid));
+        printColored("Loaded " + to_string(logs.size()) + " log entries\n\n", 10);
+        printColored("Available commands:\n", 11);
+        printColored("!!errors - Show all error messages\n", 14);
+        printColored("!!warnings - Show all warning messages\n", 14);
+        printColored("!!stats - Show log statistics\n", 14);
+        printColored("!!timeline - Show chronological event timeline\n", 14);
+        printColored("!!search <query> - Search log content\n", 14);
+        printColored("!!sort <field> - Sort logs by field\n", 14);
+        printColored("!!severity <level> - Filter by severity level\n", 14);
+        printColored("!!exit - Exit analysis mode\n\n", 12);
 
         string command;
         while (true) {
-            cout << "log-analyzer> ";
+            printColored("log-analyzer> ", 11);
             getline(cin, command);
 
-            if (command == "exit") break;
-            if (command == "help") {
-                cout << "Available commands:\n"
-                    << "!!errors - Show all error messages\n"
-                    << "!!stats - Show log statistics\n"
-                    << "!!timeline - Show timeline of events\n"
-                    << "!!search <query> - Search for specific text\n"
-                    << "!!relationships - Show log relationships\n"
-                    << "exit - Exit analysis mode\n";
-                continue;
-            }
+            if (command == "!!exit") break;
 
             if (command == "!!errors") {
-                cout << "Error messages:\n";
+                printColored("\nError messages:\n", 12);
                 for (const auto& log : logs) {
-                    if (log["entry"].get<string>().find("error") != string::npos ||
-                        log["entry"].get<string>().find("Error") != string::npos ||
-                        log["entry"].get<string>().find("ERROR") != string::npos) {
-                        cout << log["timestamp"].get<time_t>(A) << ": "
-                            << log["entry"].get<string>();
+                    if (log.find("Severity: high") != string::npos) {
+                        cout << log << "\n";
+                    }
+                }
+            }
+            else if (command == "!!warnings") {
+                printColored("\nWarning messages:\n", 14);
+                for (const auto& log : logs) {
+                    if (log.find("Severity: medium") != string::npos) {
+                        cout << log << "\n";
                     }
                 }
             }
             else if (command == "!!stats") {
-                unordered_map<string, int> type_counts;
+                unordered_map<string, int> severity_counts;
                 for (const auto& log : logs) {
-                    type_counts[log["type"].get<string>()]++;
+                    size_t pos = log.find("Severity: ");
+                    if (pos != string::npos) {
+                        string severity = log.substr(pos + 10);
+                        severity_counts[severity]++;
+                    }
                 }
 
-                cout << "Log Statistics:\n";
-                for (const auto& [type, count] : type_counts) {
-                    cout << type << ": " << count << " entries\n";
+                printColored("\nLog Statistics:\n", 11);
+                printColored("Total entries: " + to_string(logs.size()) + "\n\n", 10);
+
+                printColored("By Severity:\n", 11);
+                for (const auto& sev_pair : severity_counts) {
+                    cout << "  " << setw(15) << left << sev_pair.first << ": " << sev_pair.second << "\n";
                 }
             }
             else if (command == "!!timeline") {
-                sort(logs.begin(), logs.end(), [](const json& a, const json& b) {
-                    return a["timestamp"].get<time_t>() < b["timestamp"].get<time_t>();
-                    });
-
-                cout << "Timeline:\n";
+                printColored("\nTimeline of Events:\n", 11);
                 for (const auto& log : logs) {
-                    time_t ts = log["timestamp"].get<time_t>();
-                    cout << ctime(&ts) << ": " << log["type"].get<string>() << " - "
-                        << log["entry"].get<string>().substr(0, 50) << "...\n";
+                    cout << log << "\n";
                 }
             }
-            else if (command.find("!!search ") == 0) {
+            else if (command == "!!search" || command.find("!!search ") == 0) {
+                if (command == "!!search") {
+                    printError("Please provide a search query. Example: !!search process");
+                    continue;
+                }
                 string query = command.substr(9);
-                cout << "Search results for '" << query << "':\n";
+                if (query.empty()) {
+                    printError("Search query cannot be empty. Example: !!search process");
+                    continue;
+                }
+                printColored("\nSearch results for '" + query + "':\n", 11);
+                bool found = false;
                 for (const auto& log : logs) {
-                    if (log["entry"].get<string>().find(query) != string::npos) {
-                        cout << log["timestamp"].get<time_t>() << ": "
-                            << log["entry"].get<string>();
+                    if (log.find(query) != string::npos) {
+                        cout << log << "\n";
+                        found = true;
                     }
                 }
+                if (!found) {
+                    printWarning("No matches found for '" + query + "'");
+                }
             }
-            else if (command == "!!relationships") {
-                log_graph.print_top_relationships();
+            else if (command.find("!!severity ") == 0) {
+                string level = command.substr(11);
+                if (level.empty()) {
+                    printError("Please specify a severity level (high, medium, or low)");
+                    continue;
+                }
+                printColored("\nLogs with severity '" + level + "':\n", 11);
+                bool found = false;
+                for (const auto& log : logs) {
+                    if (log.find("Severity: " + level) != string::npos) {
+                        cout << log << "\n";
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    printWarning("No logs found with severity level '" + level + "'");
+                }
             }
             else {
-                cout << "Unknown command. Type 'help' for options.\n";
+                printError("Unknown command. Available commands:");
+                printColored("!!errors - Show all error messages\n", 14);
+                printColored("!!warnings - Show all warning messages\n", 14);
+                printColored("!!stats - Show log statistics\n", 14);
+                printColored("!!timeline - Show chronological event timeline\n", 14);
+                printColored("!!search <query> - Search log content\n", 14);
+                printColored("!!severity <level> - Filter by severity level\n", 14);
+                printColored("!!exit - Exit analysis mode\n", 14);
             }
         }
     }
 
-    void show_system_processes() {
-        cout << "System Processes:\n";
-        system("ps aux | head -n 10"); // Show first 10 processes
+    void display_recent_logs() {
+        auto recent = recent_logs.to_vector();
+        printColored("\nRecent Logs (" + to_string(recent.size()) + "):\n", 11);
+        for (const auto& log : recent) {
+            cout << log << "\n";
+        }
     }
 };
 
-// ====================== MENU INTERFACE ======================
+// ====================== MAIN MENU ======================
 
-void display_menu() {
-    cout << "\nLog Management System\n"
-        << "1. Start Log Capture\n"
-        << "2. Stop Log Capture\n"
-        << "3. List Active Logs\n"
-        << "4. Analyze Logs\n"
-        << "5. Show System Processes\n"
-        << "6. Exit\n"
-        << "Enter choice: ";
+void displayMainMenu() {
+    printHeader("WINDOWS LOG MANAGEMENT SYSTEM");
+    printMenuOption(1, "Start Log Capture");
+    printMenuOption(2, "Stop Log Capture");
+    printMenuOption(3, "List Active Logs");
+    printMenuOption(4, "Analyze Logs");
+    printMenuOption(5, "Show Running Processes");
+    printMenuOption(6, "View Recent Logs");
+    printMenuOption(7, "Exit");
+    printColored("\nEnter your choice: ", 11);
 }
 
 int main() {
     LogManager log_manager;
     int choice;
-    pid_t pid;
+    DWORD pid;
+    string input;
 
     while (true) {
-        display_menu();
+        displayMainMenu();
         cin >> choice;
-        cin.ignore(); // Clear newline
+        cin.ignore();
 
         switch (choice) {
         case 1: {
-            log_manager.show_system_processes();
-            cout << "Enter PID to monitor: ";
-            cin >> pid;
-            cin.ignore();
+            auto processes = getRunningProcesses();
+            printHeader("RUNNING PROCESSES");
+            printColored(" PID       Process Name\n", 11);
+            printColored("------------------------\n", 11);
+            for (const auto& process : processes) {
+                cout << " " << setw(8) << left << process.first << " " << process.second << "\n";
+            }
 
-            string program_name;
-            cout << "Enter program name: ";
-            getline(cin, program_name);
-
-            log_manager.start_logging(pid, program_name);
+            printColored("\nEnter PID to monitor: ", 11);
+            getline(cin, input);
+            
+            // Validate PID input
+            try {
+                pid = stoul(input);
+                string program_name = getProcessName(pid);
+                log_manager.start_logging(pid, program_name);
+            }
+            catch (const exception&) {
+                printError("Invalid PID. Please enter a valid number.");
+            }
             break;
         }
         case 2: {
-            cout << "Enter PID to stop monitoring: ";
-            cin >> pid;
-            cin.ignore();
-            log_manager.stop_logging(pid);
+            printColored("Enter PID to stop monitoring: ", 11);
+            getline(cin, input);
+            
+            // Validate PID input
+            try {
+                pid = stoul(input);
+                log_manager.stop_logging(pid);
+            }
+            catch (const exception&) {
+                printError("Invalid PID. Please enter a valid number.");
+            }
             break;
         }
         case 3:
             log_manager.list_active_logs();
             break;
         case 4: {
-            cout << "Enter PID to analyze: ";
-            cin >> pid;
-            cin.ignore();
-            log_manager.analyze_logs(pid);
+            printColored("Enter PID to analyze: ", 11);
+            getline(cin, input);
+            
+            // Validate PID input
+            try {
+                pid = stoul(input);
+                log_manager.analyze_logs(pid);
+            }
+            catch (const exception&) {
+                printError("Invalid PID. Please enter a valid number.");
+            }
             break;
         }
-        case 5:
-            log_manager.show_system_processes();
+        case 5: {
+            auto processes = getRunningProcesses();
+            printHeader("RUNNING PROCESSES");
+            printColored(" PID       Process Name\n", 11);
+            printColored("------------------------\n", 11);
+            for (const auto& process : processes) {
+                cout << " " << setw(8) << left << process.first << " " << process.second << "\n";
+            }
             break;
+        }
         case 6:
+            log_manager.display_recent_logs();
+            break;
+        case 7:
             return 0;
         default:
-            cout << "Invalid choice\n";
+            printError("Invalid choice. Please try again.");
         }
+
+        printColored("\nPress Enter to continue...", 8);
+        cin.ignore();
     }
 }
