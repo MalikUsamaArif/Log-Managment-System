@@ -1,48 +1,114 @@
-# Log-Managment-System
+# Windows Log Management System
 
-1. Introduction
-In modern software environments, especially in systems with multiple processes or services, efficient logging and monitoring are essential. This project presents a C++ Log Management System with advanced features including:
-•	Real-time system call monitoring using strace
-•	Custom priority queue for log severity management
-•	Bloom filter for quick log type checks
-•	Graph-based relationship analysis between logs
-•	Interactive log analyzer with timeline, statistics, and error tracing
+A comprehensive Windows process monitoring and logging system.
 
-2. Objectives
-•	Implement a real-time process log monitoring system.
-•	Build custom data structures to manage and analyze logs efficiently.
-•	Provide a command-line interface for log analysis and interaction.
-•	Enhance performance using multithreading and thread-safe data structures.
+## Project Overview
 
-3. System Architecture
-3.1 Components Overview
-•	LogManager: Core controller for starting, stopping, and analyzing logs.
-•	PriorityLogQueue: Custom min-heap for priority-based log sorting.
-•	LogRelationshipGraph: Graph structure to identify relations between log types.
-•	LogTypeFilter: Bloom filter to optimize log type lookups.
-•	Monitor Process: Spawns threads to run strace on target PIDs and logs system calls in JSON format.
+The Windows Log Management System is a C++ application that provides:
+- Process monitoring and logging
+- Circular buffer for log storage
+- Trie-based log search functionality
+- Real-time process tracking
 
-4. Key Features and Data Structures
-4.1 Real-Time Monitoring
-Each target process is monitored using strace, and the log output is captured and written to a .log file in JSON format.
-4.2 Custom Priority Queue
-Used to sort logs based on weight (importance or frequency):
-4.3 Log Relationship Graph
-Stores weighted connections between different types of logs (e.g., program_name → system_call):
-4.4 Bloom Filter
-Lightweight mechanism to quickly check if a certain log type has been previously encountered:
+## Features
 
-5. Interactive Analysis Features
-The system supports real-time interaction through commands like:
-Command	Functionality
-!!errors	Shows all log entries indicating errors
-!!stats	Displays count of each log type
-!!timeline	Orders logs chronologically
-!!search <query>	Searches logs for specific keywords
-!!relationships	Prints top N log type relationships
-exit	Exits analysis mode
+- Real-time process monitoring
+- Circular buffer for efficient log storage
+- Trie-based search index for fast log retrieval
+- Severity-based log classification
+- Process activity tracking
+- Log file management
+- Interactive command-line interface
+- Color-coded output for better readability
 
-6. Multithreading and Synchronization
-•	Threads are used for non-blocking process monitoring.
-•	mutex is used to ensure thread safety in all shared data structures.
-•	Each LogProcess owns a monitoring thread that tracks a PID independently.
+## Requirements
+
+- Windows OS
+- C++ compiler with C++11 support
+- Windows SDK
+
+## Installation
+
+1. Clone the repository:
+bash
+git clone <repository-url>
+cd windows-log-management-system
+
+
+2. Compile the program:
+bash
+g++ main.cpp -o log_manager
+
+
+## Usage
+
+### Running the Program
+bash
+./log_manager
+
+
+### Main Menu Options
+1. Start Log Capture
+   - View running processes
+   - Select PID to monitor
+   - Begin logging process activity
+
+2. Stop Log Capture
+   - Stop monitoring selected process
+   - Save collected logs
+
+3. List Active Logs
+   - View currently monitored processes
+   - Display log file locations
+
+4. Analyze Logs
+   - View detailed log analysis
+   - Search through logs
+   - Filter by severity
+   - View statistics
+
+5. Show Running Processes
+   - List all active processes
+   - Display PIDs and process names
+
+6. View Recent Logs
+   - Display latest log entries
+   - Monitor current activity
+
+7. Exit
+   - Safely terminate the program
+
+## Log Analysis Commands
+
+When analyzing logs, the following commands are available:
+- !!errors - Show all error messages
+- !!warnings - Show all warning messages
+- !!stats - Show log statistics
+- !!timeline - Show chronological event timeline
+- !!search <query> - Search log content
+- !!severity <level> - Filter by severity level
+- !!exit - Exit analysis mode
+
+## Project Structure
+
+
+.
+└── main.cpp    # Main C++ program
+
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (git checkout -b feature/AmazingFeature)
+3. Commit your changes (git commit -m 'Add some AmazingFeature')
+4. Push to the branch (git push origin feature/AmazingFeature)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgments
+
+- Windows API for process monitoring
+- Standard Template Library (STL) for data structures
